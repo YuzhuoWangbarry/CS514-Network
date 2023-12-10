@@ -1,18 +1,34 @@
-
-
-import numpy as np
-import torch
-import dgl
-import time
-import torch.nn.functional as F
 import argparse
-from sklearn.metrics import f1_score
+import time
+from time import localtime
+import torch
+import torch.nn.functional as F
+from dgl import DGLGraph
+from dgl.data import register_data_args, load_data
 from gat import GAT
-from dgl.data.ppi import LegacyPPIDataset
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import random
 from torch.backends import cudnn
+#from reddit import RedditDataset
+# from ms import MsDataset
+import networkx as nx
+import numpy as np
+from utils import EarlyStopping
+import csv
+
+def accuracy(logits, labels):
+    _, indices = torch.max(logits, dim=1)
+    correct = torch.sum(indices == labels)
+    return correct.item() * 1.0 / len(labels)
+
+def evaluate(model, features, labels, mask,loss_fcn):
+    model.eval()
+    with torch.no_grad():
+        logits = model(features)
+        logits = logits[mask]
+        labels = labels[mask]
+        loss_data = loss_fcn(logits, labels)
+        return accuracy(logits, labels), loss_data
 
 def set_seeds(seed):
     random.seed(seed)
@@ -23,52 +39,60 @@ def set_seeds(seed):
         cudnn.benchmark = False
         cudnn.deterministic = True
 
-def collate(sample):
-    graphs, feats, labels =map(list, zip(*sample))
-    graph = dgl.batch(graphs)
-    feats = torch.from_numpy(np.concatenate(feats))
-    labels = torch.from_numpy(np.concatenate(labels))
-    return graph, feats, labels
-
-def evaluate(feats, model, subgraph, labels, loss_fcn):
-    with torch.no_grad():
-        model.eval()
-        model.g = subgraph
-        for layer in model.gat_layers:
-            layer.g = subgraph
-        output = model(feats.float())
-        loss_data = loss_fcn(output, labels.float())
-        predict = np.where(output.data.cpu().numpy() >= 0., 1, 0)
-        score = f1_score(labels.data.cpu().numpy(),
-                         predict, average='micro')
-        return score, loss_data.item()
-        
 def main(args):
-    if args.gpu<0:
-        device = torch.device("cpu")
+    # load and preprocess dataset
+    if args.dataset == 'reddit':
+        data = RedditDataset()
+    elif args.dataset in ['photo', "computer"]:
+        data = MsDataset(args)
     else:
-        device = torch.device("cuda:" + str(args.gpu))
-    writer = SummaryWriter()
-    batch_size = args.batch_size
-    # cur_step = 0
-    # patience = args.patience
-    # best_score = -1
-    # best_loss = 10000
-    # define loss function
-    loss_fcn = torch.nn.BCEWithLogitsLoss()
-    # create the dataset
-    train_dataset = LegacyPPIDataset(mode='train')
-    valid_dataset = LegacyPPIDataset(mode='valid')
-    test_dataset = LegacyPPIDataset(mode='test')
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=collate)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size, collate_fn=collate)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate)
-    n_classes = train_dataset.labels.shape[1]
-    num_feats = train_dataset.features.shape[1]
-    g = train_dataset.graph
+        data = load_data(args)
+
+    features = torch.FloatTensor(data.features)
+    labels = torch.LongTensor(data.labels)
+    train_mask = torch.ByteTensor(data.train_mask)
+    val_mask = torch.ByteTensor(data.val_mask)
+    test_mask = torch.ByteTensor(data.test_mask)
+    num_feats = features.shape[1]
+    n_classes = data.num_labels
+    n_edges = data.graph.number_of_edges()
+    current_time = time.strftime("%H_%M_%S")
+    # writer = SummaryWriter(log_dir='runs/' + current_time + '_' + args.sess, flush_secs=30)
+
+    print("""----Data statistics------'
+      #Edges %d
+      #Classes %d
+      #Train samples %d
+      #Val samples %d
+      #Test samples %d""" %
+          (n_edges, n_classes,
+           train_mask.sum().item(),
+           val_mask.sum().item(),
+           test_mask.sum().item()))
+
+    if args.gpu < 0:
+        cuda = False
+    else:
+        cuda = True
+        torch.cuda.set_device(args.gpu)
+        features = features.cuda()
+        labels = labels.cuda()
+        train_mask = train_mask.bool().cuda()
+        val_mask = val_mask.bool().cuda()
+        test_mask = test_mask.bool().cuda()
+
+
+    g = data.graph
+    # add self loop
+    if args.dataset != 'reddit':
+        g.remove_edges_from(nx.selfloop_edges(g))
+        g = DGLGraph(g)
+    g.add_edges(g.nodes(), g.nodes())
+    n_edges = g.number_of_edges()
+    print('edge number %d'%(n_edges))
+    # create model
     heads = ([args.num_heads] * args.num_layers) + [args.num_out_heads]
 
-    # define the model
     model = GAT(g,
                 args.num_layers,
                 num_feats,
@@ -76,129 +100,114 @@ def main(args):
                 n_classes,
                 heads,
                 F.elu,
-                args.in_drop,
-                args.attn_drop,
+                args.idrop,
+                args.adrop,
                 args.alpha,
                 args.bias,
                 args.residual, args.l0)
     print(model)
-    # define the optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    model = model.to(device)
-    best_epoch = 0
-    dur = []
-    acc = []
-    for epoch in range(args.epochs):
-        num = 0
-        model.train()
-        if epoch % 5 == 0:
-            t0 = time.time()
-        loss_list = []
-        for batch, data in enumerate(train_dataloader):
-            subgraph, feats, labels = data
-            feats = feats.to(device)
-            labels = labels.to(device)
-            model.g = subgraph
-            for layer in model.gat_layers:
-                layer.g = subgraph
-            logits = model(feats.float())
-            loss = loss_fcn(logits, labels.float())
-            loss_l0 = args.loss_l0 *(model.gat_layers[0].loss)
-            optimizer.zero_grad()
-            (loss+loss_l0).backward()
-            optimizer.step()
-            loss_list.append(loss.item())
-            num += model.gat_layers[0].num
+    if args.early_stop:
+        stopper = EarlyStopping(patience=150)
+    if cuda:
+        model.cuda()
+    loss_fcn = torch.nn.CrossEntropyLoss()
 
-        if epoch % 5 == 0:
+    # use optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    dur = []
+    time_used = 0
+    start_time = time.time()
+    file = open('SGAT.csv', 'w', newline='')
+    writer = csv.writer(file)
+    writer.writerow(['Epoch', 'Loss', 'Train Accuracy', 'Test Accuracy'])
+    for epoch in range(args.epochs):
+        model.train()
+        if epoch >= 3:
+            t0 = time.time()
+
+        # forward
+        logits = model(features)
+        loss = loss_fcn(logits[train_mask], labels[train_mask])
+
+        loss_l0 = args.loss_l0*( model.gat_layers[0].loss)
+        optimizer.zero_grad()
+        (loss + loss_l0).backward()
+        optimizer.step()
+
+        if epoch >= 3:
             dur.append(time.time() - t0)
 
-        loss_data = np.array(loss_list).mean()
-        print("Epoch {:05d} | Loss: {:.4f}".format(epoch + 1, loss_data))
-        writer.add_scalar('edge_num/0', num, epoch)
+        train_acc = accuracy(logits[train_mask], labels[train_mask])
+        # writer.add_scalar('edge_num/0', model.gat_layers[0].num, epoch)
 
-        if epoch%5 == 0:
-            score_list = []
-            val_loss_list = []
-            for batch, valid_data in enumerate(valid_dataloader):
-                subgraph, feats, labels = valid_data
-                feats = feats.to(device)
-                labels = labels.to(device)
-                score, val_loss = evaluate(feats.float(), model, subgraph, labels.float(), loss_fcn)
-                score_list.append(score)
-                val_loss_list.append(val_loss)
-
-            mean_score = np.array(score_list).mean()
-            mean_val_loss = np.array(val_loss_list).mean()
-            print("val F1-Score: {:.4f} ".format(mean_score))
-            writer.add_scalar('loss', mean_val_loss, epoch)
-            writer.add_scalar('f1/test_f1_mic', mean_score, epoch)
-
-            acc.append(mean_score)
-
-            # # early stop
-            # if mean_score > best_score or best_loss > mean_val_loss:
-            #     if mean_score > best_score and best_loss > mean_val_loss:
-            #         val_early_loss = mean_val_loss
-            #         val_early_score = mean_score
-            #         torch.save(model.state_dict(), '{}.pkl'.format('save_rand'))
-            #         best_epoch = epoch
-            #
-            #     best_score = np.max((mean_score, best_score))
-            #     best_loss = np.min((best_loss, mean_val_loss))
-            #     cur_step = 0
-            # else:
-            #     cur_step += 1
-            #     if cur_step == patience:
-            #         break
-
-
-    test_score_list = []
-    for batch, test_data in enumerate(test_dataloader):
-        subgraph, feats, labels = test_data
-        feats = feats.to(device)
-        labels = labels.to(device)
-        test_score_list.append(evaluate(feats, model, subgraph, labels.float(), loss_fcn)[0])
-    acc = np.array(test_score_list).mean()
-    print("test F1-Score: {:.4f}".format(acc))
-    writer.close()
+        if args.fastmode:
+            val_acc, loss = accuracy(logits[val_mask], labels[val_mask], loss_fcn)
+        else:
+            val_acc,_ = evaluate(model, features, labels, val_mask, loss_fcn)
+            if args.early_stop:
+                if stopper.step(val_acc, model):   
+                    break
+        writer.writerow([epoch, loss.item(), train_acc, val_acc])
+        print("Epoch {:05d} | Time(s) {:.4f} | Loss {:.4f} | TrainAcc {:.4f} |"
+              " ValAcc {:.4f} | ETputs(KTEPS) {:.2f}".format(epoch, np.mean(dur), loss.item(), train_acc,
+                     val_acc, n_edges / np.mean(dur) / 1000))
+        # writer.add_scalar('loss', loss.item(), epoch)
+        # writer.add_scalar('f1/train_f1_mic', train_acc, epoch)
+        # writer.add_scalar('f1/test_f1_mic', val_acc, epoch)
+        # writer.add_scalar('time/time', time_used, epoch)
+    file.close()
+    # writer.close()
+    end_time = time.time() 
+    elapsed_time = end_time - start_time
+    print(f"The function took {elapsed_time} seconds to complete.")
+    # if args.early_stop:
+    #     model.load_state_dict(torch.load('es_checkpoint.pt'))
+    acc, _ = evaluate(model,features, labels, test_mask, loss_fcn)
+    print("Test Accuracy {:.4f}".format(acc))
 
 
 if __name__ == '__main__':
+
     parser = argparse.ArgumentParser(description='GAT')
+    register_data_args(parser)
     parser.add_argument("--gpu", type=int, default=-1,
                         help="which GPU to use. Set -1 to use CPU.")
-    parser.add_argument("--epochs", type=int, default=400,
+    parser.add_argument("--epochs", type=int, default=200,
                         help="number of training epochs")
-    parser.add_argument("--num-heads", type=int, default=4,
+    parser.add_argument("--num-heads", type=int, default=8,
                         help="number of hidden attention heads")
-    parser.add_argument("--num-out-heads", type=int, default=6,
+    parser.add_argument("--l0", type=int, default=0, help="l0")
+    parser.add_argument("--num-out-heads", type=int, default=1,
                         help="number of output attention heads")
-    parser.add_argument("--num-layers", type=int, default=2,
+    parser.add_argument("--num-layers", type=int, default=1,
                         help="number of hidden layers")
-    parser.add_argument("--num-hidden", type=int, default=256,
+    parser.add_argument("--num-hidden", type=int, default=8,
                         help="number of hidden units")
-    parser.add_argument("--residual", action="store_true", default=True,
+    parser.add_argument("--residual", action="store_true", default=False,
                         help="use residual connection")
-    parser.add_argument("--in-drop", type=float, default=0,
+    parser.add_argument("--idrop", type=float, default=.6,
                         help="input feature dropout")
-    parser.add_argument("--attn-drop", type=float, default=0,
+    parser.add_argument("--adrop", type=float, default=.6,
                         help="attention dropout")
     parser.add_argument("--lr", type=float, default=0.005,
                         help="learning rate")
-    parser.add_argument('--weight-decay', type=float, default=0,
+    parser.add_argument('--weight-decay', type=float, default=5e-4,
                         help="weight decay")
     parser.add_argument('--alpha', type=float, default=0.2,
                         help="the negative slop of leaky relu")
-    parser.add_argument('--batch-size', type=int, default=2,
-                        help="batch size used for training, validation and test")
-    parser.add_argument('--bias', type=int, default=5,
-                        help="bias for l0 to control many edges will be used at the begining")
-    parser.add_argument('--patience', type=int, default=10,
-                        help="used for early stop")
+    parser.add_argument('--early-stop', action='store_true', default=True,
+                        help="indicates whether to use early stop or not")
+    parser.add_argument('--fastmode', action="store_true", default=False,
+                        help="skip re-evaluate the validation set")
     parser.add_argument('--seed', type=int, default=123, help='Random seed.')
-    parser.add_argument('--loss_l0', type=float, default=0, help='loss for L0 regularization.')
-    parser.add_argument("--l0", type=int, default=0, help="l0")
+    parser.add_argument('--bias', type=int, default=0,
+                        help="bias for l0 to control many edges will be used at the begining")
+    parser.add_argument('--loss_l0', type=float, default=0, help='loss for L0 regularization')
+    parser.add_argument("--syn_type", type=str, default='scipy', help="reddit")
+    parser.add_argument("--self-loop", action='store_true', help="graph self-loop (default=False)")
+    parser.add_argument('--sess', default='default', type=str, help='session id')
+    parser.set_defaults(self_loop=False)
     args = parser.parse_args()
     print(args)
     set_seeds(args.seed)
