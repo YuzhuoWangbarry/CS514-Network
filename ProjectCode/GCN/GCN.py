@@ -6,6 +6,7 @@ import torch.nn.functional as func
 import torch_geometric
 from torch_geometric.nn import GCNConv
 from torch_geometric.datasets import Planetoid
+from torch_geometric.datasets import Reddit
 
 # import matplotlib
 # matplotlib.use('TKAgg')

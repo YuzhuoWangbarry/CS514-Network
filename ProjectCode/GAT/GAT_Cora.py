@@ -68,9 +68,9 @@ class GAT_ten(torch.nn.Module):
         
         return func.log_softmax(x, dim=1)
     
-class GAT_five(torch.nn.Module):
+class GAT(torch.nn.Module):
     def __init__(self, dataset, hidden=8, heads=8):
-        super(GAT_five, self).__init__()
+        super(GAT, self).__init__()
         self.conv1 = GATConv(dataset.num_node_features, hidden, heads=heads)
         self.conv2 = GATConv(heads * hidden, hidden, heads=heads)
         self.conv3 = GATConv(heads * hidden, hidden, heads=heads)
@@ -130,7 +130,7 @@ def test(data, train=True):
 
 def train(data):
     losses, train_accurate, test_accurate = list(), list(), list()
-    with open("GAT_ACC.csv", 'w', newline='') as csvfile:
+    with open("CSV_files/GAT_Cora.csv", 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Epoch', 'Loss', 'Train Accuracy', 'Test Accuracy'])
 
@@ -158,7 +158,7 @@ if __name__ == "__main__":
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # model = GAT_two(dataset).to(device) #Two layers training
-    model = GAT_five(dataset).to(device) #Five layers training
+    model = GAT(dataset).to(device) #Five layers training
     # model = GAT_ten(dataset).to(device) #Ten layers training
     data = dataset[0].to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
